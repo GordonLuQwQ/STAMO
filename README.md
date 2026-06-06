@@ -339,3 +339,4 @@ If you use this work in your research, please cite:
 ## License
 
 For academic use, this project is licensed under the 2-clause BSD License. For commercial use, please contact Chunhua Shen.
+# STAMO
