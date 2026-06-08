@@ -1,4 +1,5 @@
 import os
+from contextlib import nullcontext
 from typing import Any, Dict
 
 import numpy as np
@@ -150,6 +151,14 @@ class Trainer:
         self.model.set_trainable_params()
         if not self.use_fabric:
             self.move_model_to_cuda()
+            if self.resume:
+                assert os.path.exists(self.resume_path)
+                overwatch.warning(f"Resuming from {self.resume_path}")
+                self.load_checkpoint(self.resume_path)
+            if not self.do_train:
+                self.model.eval()
+            overwatch.info(f"Successfully built models with {get_parameters(self.model)} parameters")
+            return
         self.prepare_dist_model()
 
     def train_eval_by_iter(self, train_loader, eval_loader=None, use_tqdm=True) -> None:
@@ -201,13 +210,19 @@ class Trainer:
                 inputs["global_step"] = self.global_step
                 is_accumulating = self.global_step % self.gradient_accumulate_steps != 0
 
-                with self.fabric.no_backward_sync(self.model, enabled=is_accumulating):
+                sync_context = (
+                    self.fabric.no_backward_sync(self.model, enabled=is_accumulating)
+                    if self.use_fabric
+                    else nullcontext()
+                )
+                with sync_context:
                     inputs = self.prepare_batch(inputs)
                     outputs = self.forward_step(inputs, criterion=self.criterion)
                     self.backward_step(outputs["loss"])
 
                 loss_to_log = outputs["loss"].item()
-                self.fabric.log("loss", loss_to_log, step=self.global_step)
+                if self.use_fabric:
+                    self.fabric.log("loss", loss_to_log, step=self.global_step)
                 if not is_accumulating:
                     self.step()
                     self.lr_scheduler.step()
