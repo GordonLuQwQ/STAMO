@@ -4,7 +4,7 @@ log_dir: "logs"
 resume: False
 resume_path: ""
 task_name: "egomimic.2_1024"
-fabric: True
+fabric: False
 
 
 vision_backbone:

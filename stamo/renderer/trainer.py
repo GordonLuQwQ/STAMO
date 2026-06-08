@@ -32,7 +32,7 @@ class Trainer:
 
         self.local_rank = overwatch.local_rank()
         self.rank = overwatch.rank()
-        self.device = get_accelerator_device()  # edit for musa
+        self.device = get_accelerator_device(self.local_rank if overwatch.world_size() > 1 else None)  # edit for musa
 
         self.epoch = -1
         self.global_step = -1
@@ -40,7 +40,7 @@ class Trainer:
         self.eval_before_train = False
 
         self.use_deepspeed = args.deepspeed
-        self.use_fabric = args.fabric
+        self.use_fabric = args.fabric and not self.use_deepspeed
 
         self.resume = args.resume
         self.resume_path = args.resume_path
@@ -78,6 +78,38 @@ class Trainer:
                 self.optimizer.load_state_dict(complex_to_device(self.optimizer.state_dict(), device=self.device))
 
     def prepare_dist_model(self) -> None:
+        if self.use_deepspeed:
+            import deepspeed
+
+            ds_config = {
+                "train_micro_batch_size_per_gpu": self.local_batch_size,
+                "gradient_accumulation_steps": self.gradient_accumulate_steps,
+                "steps_per_print": 100,
+                "zero_optimization": {
+                    "stage": 2,
+                    "allgather_partitions": True,
+                    "reduce_scatter": True,
+                    "overlap_comm": True,
+                    "contiguous_gradients": True,
+                },
+                "fp16": {"enabled": True},
+                "bf16": {"enabled": False},
+            }
+            self.model, self.optimizer, _, self.lr_scheduler = deepspeed.initialize(
+                model=self.model,
+                optimizer=self.optimizer,
+                lr_scheduler=self.lr_scheduler,
+                config=ds_config,
+            )
+            if self.resume:
+                assert os.path.exists(self.resume_path)
+                overwatch.warning(f"Resuming from {self.resume_path}")
+                self.load_checkpoint(self.resume_path)
+            if not self.do_train:
+                self.model.eval()
+            overwatch.info(f"Successfully built models with {get_parameters(self.model)} parameters")
+            return
+
         tb = TensorBoardLogger(root_dir=self.log_dir, version=0)
         self.fabric = Fabric(loggers=tb)
         if self.resume:
@@ -106,12 +138,16 @@ class Trainer:
 
     def prepare_batch(self, batch) -> Dict[str, Any]:
         batch = move_to_cuda(batch, device=self.device)  # edit for musa
-        batch = fp32_to_bf16(batch)
         if self.use_deepspeed:
             batch = fp32_to_fp16(batch)
+        elif self.use_fabric:
+            batch = fp32_to_bf16(batch)
         return batch
 
     def step(self, optimizer_idx=-1) -> None:
+        if self.use_deepspeed:
+            self.model.step()
+            return
         if optimizer_idx >= 0 and isinstance(self.optimizer, list):
             optimizer = self.optimizer[optimizer_idx]
         else:
@@ -149,16 +185,8 @@ class Trainer:
             ensure_dirname(self.log_dir, override=False)
 
         self.model.set_trainable_params()
-        if not self.use_fabric:
+        if not self.use_fabric and not self.use_deepspeed:
             self.move_model_to_cuda()
-            if self.resume:
-                assert os.path.exists(self.resume_path)
-                overwatch.warning(f"Resuming from {self.resume_path}")
-                self.load_checkpoint(self.resume_path)
-            if not self.do_train:
-                self.model.eval()
-            overwatch.info(f"Successfully built models with {get_parameters(self.model)} parameters")
-            return
         self.prepare_dist_model()
 
     def train_eval_by_iter(self, train_loader, eval_loader=None, use_tqdm=True) -> None:
@@ -225,7 +253,8 @@ class Trainer:
                     self.fabric.log("loss", loss_to_log, step=self.global_step)
                 if not is_accumulating:
                     self.step()
-                    self.lr_scheduler.step()
+                    if not self.use_deepspeed:
+                        self.lr_scheduler.step()
 
                 metric_and_loss = {k: v for k, v in outputs.items() if k.split("_")[0] in ["metric", "loss"]}
                 for k, v in metric_and_loss.items():
