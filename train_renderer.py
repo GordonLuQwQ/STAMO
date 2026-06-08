@@ -1,3 +1,6 @@
+import random
+
+import numpy as np
 import torch
 
 from stamo.renderer.model.renderer import RenderNet
@@ -14,6 +17,19 @@ overwatch = initialize_overwatch(__name__)
 
 
 def main(args):
+    try:
+        import torch_musa  # noqa: F401  # edit for musa
+    except ImportError:
+        pass
+
+    random.seed(args.seed)  # edit for musa
+    np.random.seed(args.seed)  # edit for musa
+    torch.manual_seed(args.seed)  # edit for musa
+    if hasattr(torch, "musa") and torch.musa.is_available():  # edit for musa
+        torch.musa.manual_seed_all(args.seed)  # edit for musa
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     # init models
     overwatch.info("Building models...")
     model = RenderNet(args)

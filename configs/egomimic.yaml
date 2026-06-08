@@ -54,3 +54,4 @@ train:
   gradient_accumulate_steps: 1
   deepspeed_zero_stage: 0
   deepspeed_fp16: False
+  deepspeed_skip_model_broadcast: True

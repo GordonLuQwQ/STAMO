@@ -43,6 +43,7 @@ class Trainer:
         self.use_fabric = args.fabric and not self.use_deepspeed
         self.deepspeed_zero_stage = int(args.train.get("deepspeed_zero_stage", 0))
         self.deepspeed_fp16 = bool(args.train.get("deepspeed_fp16", False))
+        self.deepspeed_skip_model_broadcast = bool(args.train.get("deepspeed_skip_model_broadcast", False))
 
         self.resume = args.resume
         self.resume_path = args.resume_path
@@ -79,9 +80,44 @@ class Trainer:
             else:
                 self.optimizer.load_state_dict(complex_to_device(self.optimizer.state_dict(), device=self.device))
 
+    def verify_model_checksum(self) -> None:
+        if not (DIST.is_available() and DIST.is_initialized() and overwatch.world_size() > 1):
+            return
+
+        module = self.model.module if hasattr(self.model, "module") else self.model
+        checksum = torch.zeros(3, device=self.device, dtype=torch.float32)
+        with torch.no_grad():
+            for tensor in list(module.parameters()) + list(module.buffers()):
+                if tensor is None or tensor.numel() == 0:
+                    continue
+                data = tensor.detach().to(device=self.device, dtype=torch.float32)
+                checksum[0] += data.sum()
+                checksum[1] += data.abs().sum()
+                checksum[2] += data.square().sum()
+
+        local_checksum = checksum.clone()
+        avg_checksum = checksum.clone()
+        DIST.all_reduce(avg_checksum)
+        avg_checksum /= overwatch.world_size()
+
+        max_diff = (local_checksum - avg_checksum).abs().max()
+        DIST.all_reduce(max_diff, op=DIST.ReduceOp.MAX)
+        if max_diff.item() > 1e-2:
+            raise RuntimeError(f"MUSA DeepSpeed model checksum mismatch across ranks: max_diff={max_diff.item():.6f}")
+
+        overwatch.info(f"MUSA DeepSpeed model checksum verified: {local_checksum.tolist()}")  # edit for musa
+
     def prepare_dist_model(self) -> None:
         if self.use_deepspeed:
             import deepspeed
+
+            original_broadcast_model = None
+            if self.deepspeed_skip_model_broadcast:  # edit for musa
+                from deepspeed.runtime.engine import DeepSpeedEngine  # edit for musa
+
+                if hasattr(DeepSpeedEngine, "_broadcast_model"):  # edit for musa
+                    original_broadcast_model = DeepSpeedEngine._broadcast_model  # edit for musa
+                    DeepSpeedEngine._broadcast_model = lambda self: None  # edit for musa
 
             ds_config = {
                 "train_micro_batch_size_per_gpu": self.local_batch_size,
@@ -98,16 +134,22 @@ class Trainer:
                     "overlap_comm": True,
                     "contiguous_gradients": True,
                 }
-            self.model, self.optimizer, _, self.lr_scheduler = deepspeed.initialize(
-                model=self.model,
-                optimizer=self.optimizer,
-                lr_scheduler=self.lr_scheduler,
-                config=ds_config,
-            )
+            try:
+                self.model, self.optimizer, _, self.lr_scheduler = deepspeed.initialize(
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    lr_scheduler=self.lr_scheduler,
+                    config=ds_config,
+                )
+            finally:
+                if original_broadcast_model is not None:  # edit for musa
+                    DeepSpeedEngine._broadcast_model = original_broadcast_model  # edit for musa
             if self.resume:
                 assert os.path.exists(self.resume_path)
                 overwatch.warning(f"Resuming from {self.resume_path}")
                 self.load_checkpoint(self.resume_path)
+            if self.deepspeed_skip_model_broadcast:  # edit for musa
+                self.verify_model_checksum()  # edit for musa
             if not self.do_train:
                 self.model.eval()
             overwatch.info(f"Successfully built models with {get_parameters(self.model)} parameters")
