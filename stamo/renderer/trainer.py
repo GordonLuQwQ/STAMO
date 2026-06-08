@@ -41,6 +41,8 @@ class Trainer:
 
         self.use_deepspeed = args.deepspeed
         self.use_fabric = args.fabric and not self.use_deepspeed
+        self.deepspeed_zero_stage = int(args.train.get("deepspeed_zero_stage", 0))
+        self.deepspeed_fp16 = bool(args.train.get("deepspeed_fp16", False))
 
         self.resume = args.resume
         self.resume_path = args.resume_path
@@ -85,16 +87,17 @@ class Trainer:
                 "train_micro_batch_size_per_gpu": self.local_batch_size,
                 "gradient_accumulation_steps": self.gradient_accumulate_steps,
                 "steps_per_print": 100,
-                "zero_optimization": {
-                    "stage": 2,
+                "fp16": {"enabled": self.deepspeed_fp16},
+                "bf16": {"enabled": False},
+            }
+            if self.deepspeed_zero_stage > 0:
+                ds_config["zero_optimization"] = {
+                    "stage": self.deepspeed_zero_stage,
                     "allgather_partitions": True,
                     "reduce_scatter": True,
                     "overlap_comm": True,
                     "contiguous_gradients": True,
-                },
-                "fp16": {"enabled": True},
-                "bf16": {"enabled": False},
-            }
+                }
             self.model, self.optimizer, _, self.lr_scheduler = deepspeed.initialize(
                 model=self.model,
                 optimizer=self.optimizer,
@@ -138,7 +141,7 @@ class Trainer:
 
     def prepare_batch(self, batch) -> Dict[str, Any]:
         batch = move_to_cuda(batch, device=self.device)  # edit for musa
-        if self.use_deepspeed:
+        if self.use_deepspeed and self.deepspeed_fp16:
             batch = fp32_to_fp16(batch)
         elif self.use_fabric:
             batch = fp32_to_bf16(batch)
