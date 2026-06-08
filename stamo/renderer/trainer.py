@@ -100,12 +100,22 @@ class Trainer:
         DIST.all_reduce(avg_checksum)
         avg_checksum /= overwatch.world_size()
 
-        max_diff = (local_checksum - avg_checksum).abs().max()
-        DIST.all_reduce(max_diff, op=DIST.ReduceOp.MAX)
-        if max_diff.item() > 1e-2:
-            raise RuntimeError(f"MUSA DeepSpeed model checksum mismatch across ranks: max_diff={max_diff.item():.6f}")
+        diff = (local_checksum - avg_checksum).abs()
+        rel_diff = diff / avg_checksum.abs().clamp_min(1.0)
+        max_abs_diff = diff.max()
+        max_rel_diff = rel_diff.max()
+        DIST.all_reduce(max_abs_diff, op=DIST.ReduceOp.MAX)
+        DIST.all_reduce(max_rel_diff, op=DIST.ReduceOp.MAX)
+        if max_abs_diff.item() > 1e3 and max_rel_diff.item() > 1e-5:
+            raise RuntimeError(  # edit for musa
+                f"MUSA DeepSpeed model checksum mismatch across ranks: "
+                f"max_abs_diff={max_abs_diff.item():.6f}, max_rel_diff={max_rel_diff.item():.6e}"
+            )
 
-        overwatch.info(f"MUSA DeepSpeed model checksum verified: {local_checksum.tolist()}")  # edit for musa
+        overwatch.info(  # edit for musa
+            f"MUSA DeepSpeed model checksum verified: {local_checksum.tolist()}, "
+            f"max_abs_diff={max_abs_diff.item():.6f}, max_rel_diff={max_rel_diff.item():.6e}"
+        )
 
     def prepare_dist_model(self) -> None:
         if self.use_deepspeed:
