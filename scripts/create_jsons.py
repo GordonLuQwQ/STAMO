@@ -98,30 +98,7 @@ def create_split_jsonl(train_image_dirs: List[str], eval_image_dirs: List[str], 
 
 if __name__ == "__main__":
     train_image_dirs = [
-        "/mnt/public/dataset2/RoboRender_datasets/libero/libero_10/train",
-        "/mnt/public/dataset2/RoboRender_datasets/libero/libero_90/train",
-        "/mnt/public/dataset2/RoboRender_datasets/libero/libero_goal/train",
-        "/mnt/public/dataset2/RoboRender_datasets/libero/libero_object/train",
-        "/mnt/public/dataset2/RoboRender_datasets/libero/libero_spatial/train",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/AUTOLab",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/CLVR",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/GuptaLab",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/ILIAD",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/PennPAL",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/RAD",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/RAIL",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/REAL",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/RPL",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/TRI",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/WEIRD",
-    ]
+        "/workspace/datasets/HOI4D_processed/images"]
 
-    eval_image_dirs = [
-        "/mnt/public/dataset2/RoboRender_datasets/libero/libero_10/eval",
-        "/mnt/public/dataset2/RoboRender_datasets/libero/libero_90/eval",
-        "/mnt/public/dataset2/RoboRender_datasets/libero/libero_goal/eval",
-        "/mnt/public/dataset2/RoboRender_datasets/libero/libero_object/eval",
-        "/mnt/public/dataset2/RoboRender_datasets/libero/libero_spatial/eval",
-        "/mnt/public/dataset2/RoboRender_datasets/droid/test",
-    ]
+    eval_image_dirs = []
     create_split_jsonl(train_image_dirs, eval_image_dirs, "VLA")

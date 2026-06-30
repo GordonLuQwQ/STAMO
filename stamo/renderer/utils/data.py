@@ -327,12 +327,35 @@ def load_unsampler_datasets_from_json(
             drop_last=drop_last,
         )
     else:
+        # Original non-distributed eval loader:
+        # dataloader = DataLoader(
+        #     dataset,
+        #     batch_size=local_batch_size,
+        #     num_workers=num_workers,
+        #     collate_fn=collate_fn,
+        #     shuffle=shuffle,
+        #     drop_last=drop_last,
+        # )
+
+        # Distributed eval loader:
+        # each rank receives a different shard of the finite eval dataset.
+        sampler = None
+        if num_replicas > 1:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=num_replicas,
+                rank=rank,
+                shuffle=shuffle,
+                drop_last=drop_last,
+            )
+
         dataloader = DataLoader(
             dataset,
             batch_size=local_batch_size,
             num_workers=num_workers,
             collate_fn=collate_fn,
-            shuffle=shuffle,
+            sampler=sampler,
+            shuffle=False if sampler is not None else shuffle,
             drop_last=drop_last,
         )
     return dataloader

@@ -92,7 +92,8 @@ def main(args):
         _, images_per_batch, args.train.iter_per_ep, args.train.num_iters = train_info
         trainer.iter_per_ep = args.train.iter_per_ep
         trainer.num_iters = args.train.num_iters
-
+        if not isinstance(trainer.global_step, int):
+            trainer.global_step = 30000
         overwatch.info(f"Total batch size {images_per_batch}")
         overwatch.info(f"Total training steps {args.train.num_iters}")
         overwatch.info(f"Starting train iter: {trainer.global_step + 1}")

@@ -1,10 +1,10 @@
 seed: 33
 do_train: True
 log_dir: "logs"
-resume: False
-resume_path: ""
+resume: True                                   
+resume_path: "/workspace/STAMO/ckpts/VLA.2_1024/30000"
 task_name: "VLA.2_1024"
-fabric: True
+fabric: False
 
 
 vision_backbone:
@@ -14,12 +14,14 @@ vision_backbone:
   # local_ckpt: "/mnt/public/weight/vit_base_patch16_clip_224/pytorch_model.bin"
   # model_name: "vit_base_patch16_siglip_224.v2_webli"
   # local_ckpt: "/mnt/public/weight/vit_base_patch16_siglip_224/pytorch_model.bin"
-  model_name: "vit_base_patch14_reg4_dinov2.lvd142m"
-  local_ckpt: "/mnt/public/weight/vit_base_patch14_reg4_dinov2.lvd142m/pytorch_model.bin"
+  #model_name: "vit_base_patch14_reg4_dinov2.lvd142m"
+  #local_ckpt: "/mnt/public/weight/vit_base_patch14_reg4_dinov2.lvd142m/pytorch_model.bin"
   # model_name: "vit_base_patch14_dinov2.lvd142m"
   # local_ckpt: "/mnt/public/weight/vit_base_patch14_dinov2.lvd142m/pytorch_model.bin"
   # model_name: "vit_so400m_patch14_siglip_224.webli"
   # local_ckpt: "/mnt/public/weight/vit_so400m_patch14_siglip_224.webli/pytorch_model.bin"
+  model_name: "vit_base_patch14_reg4_dinov2.lvd142m"
+  local_ckpt: "/workspace/weights/vit_base_patch14_reg4_dinov2.lvd142m/pytorch_model.bin"
   pretrained: False
 
 
@@ -38,24 +40,24 @@ render_net:
   guidance_scale: 1
   num_inference_steps: 50
   sd3:
-    local_ckpt: "/mnt/public/weight/stable-diffusion-3-medium-diffusers"
-
+    local_ckpt: "/workspace/weights/stable-diffusion-3-medium-diffusers"
 
 data:
   flip_p: 0.5
   img_size: 224
-  num_workers: 32
+  num_workers: 2
   train_json_path: "./jsons/train_VLA.json"
   eval_json_path: "./jsons/eval_VLA.json"
 
 
 train:
   dist: True
-  epochs: 2000
-  num_iters: 10000
-  eval_step: 5000
-  save_step: 5000
-  local_batch_size: 128
+  epochs: 20
+  num_iters: 5000
+  max_steps: 10000
+  eval_step: 2500
+  save_step: 20000
+  local_batch_size: 8
   learning_rate: 3e-5
   decay: 1e-3
   constant_lr: False
