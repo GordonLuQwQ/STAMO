@@ -1,8 +1,7 @@
-# edit for musa
-DS_ACCELERATOR=${DS_ACCELERATOR:-musa} MUSA_VISIBLE_DEVICES=${MUSA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7} fabric run model train_renderer.py \
-    --config_path configs/libero.yaml \
-    --strategy='deepspeed_stage_2' \
-    --devices=8 \
-    --accelerator=${STAMO_ACCELERATOR:-musa} \
-    --precision="bf16-true" \
-    --main-port=52444
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+export CONFIG_PATH="${CONFIG_PATH:-configs/libero.yaml}"
+exec bash "${SCRIPT_DIR}/train_multi.sh"

@@ -52,6 +52,3 @@ train:
   eval_scheduler: ddpm
   ckpt_save_dir: "ckpts"
   gradient_accumulate_steps: 1
-  deepspeed_zero_stage: 0
-  deepspeed_fp16: False
-  deepspeed_skip_model_broadcast: True

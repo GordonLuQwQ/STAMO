@@ -10,7 +10,7 @@ import torchvision.transforms as T
 from PIL import Image
 from torch.utils.data import BatchSampler, DataLoader, Dataset, DistributedSampler
 
-from stamo.renderer.utils.device import get_accelerator_device  # edit for musa
+from stamo.renderer.utils.device import get_accelerator_device
 from stamo.renderer.utils.overwatch import initialize_overwatch
 
 
@@ -64,7 +64,7 @@ def fp32_to_bf16(batch):
     return new_batch
 
 
-def move_to_cuda(batch, device=None):  # edit for musa
+def move_to_cuda(batch, device=None):
     device = device or get_accelerator_device()
     if isinstance(batch, torch.Tensor):
         return batch.to(device=device, non_blocking=True)
@@ -84,10 +84,11 @@ def collate_fn(inputs):
     return {"images": images}
 
 
-def get_loader_info(dataset, epochs, bsz):
+def get_loader_info(dataset, epochs, bsz, gradient_accumulate_steps=1):
+    dataset_len = len(dataset.dataset) if hasattr(dataset, "dataset") else len(dataset)
     images_per_gpu = bsz
-    images_per_batch = bsz * overwatch.world_size()
-    iter_per_ep = len(dataset) // overwatch.world_size()
+    images_per_batch = bsz * overwatch.world_size() * gradient_accumulate_steps
+    iter_per_ep = dataset_len // images_per_batch
     num_iters = iter_per_ep * epochs
     loader_info = (images_per_gpu, images_per_batch, iter_per_ep, num_iters)
     return loader_info

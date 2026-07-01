@@ -1,3 +1,4 @@
+import os
 import random
 
 import numpy as np
@@ -16,54 +17,49 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 overwatch = initialize_overwatch(__name__)
 
 
-def main(args):
-    try:
-        import torch_musa  # noqa: F401  # edit for musa
-    except ImportError:
-        pass
-
-    random.seed(args.seed)  # edit for musa
-    np.random.seed(args.seed)  # edit for musa
-    torch.manual_seed(args.seed)  # edit for musa
-    if hasattr(torch, "musa") and torch.musa.is_available():  # edit for musa
-        torch.musa.manual_seed_all(args.seed)  # edit for musa
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def setup_cuda_device(args) -> None:
+    if not torch.cuda.is_available():
+        overwatch.warning("CUDA is not available; falling back to CPU.")
+        return
+
+    local_rank = int(getattr(args, "local_rank", os.environ.get("LOCAL_RANK", 0)))
+    device_count = torch.cuda.device_count()
+    if local_rank >= device_count:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} but only {device_count} CUDA device(s) are visible. "
+            "Check CUDA_VISIBLE_DEVICES and the launch command."
+        )
+    torch.cuda.set_device(local_rank)
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
+def get_warmup_ratio(args) -> float:
+    if "warmup_ratio" in args.train:
+        return float(args.train.warmup_ratio)
+    return float(getattr(args, "warmup_ratio", 0.00001))
+
+
+def main(args):
+    set_seed(args.seed)
+    setup_cuda_device(args)
 
     # init models
     overwatch.info("Building models...")
     model = RenderNet(args)
     if args.do_train:
         overwatch.warning("Do training...")
-
-        optimizer = get_optimizer(
-            (p for p in model.parameters() if p.requires_grad),
-            opt_type="AdamW",
-            lr=args.train.learning_rate,
-            betas=(0.9, 0.98),
-            weight_decay=args.train.decay,
-        )
-
-        criterion = get_criterion(
-            loss_type="diffusion",
-            reduction="mean",
-        )
-
-        if args.train.constant_lr:
-            scheduler = WarmupLinearConstantLR(
-                optimizer,
-                max_iter=(args.train.num_iters // args.train.gradient_accumulate_steps) + 1,
-                warmup_ratio=getattr(args, "warmup_ratio", 0.00001),
-            )
-        else:
-            scheduler = WarmupLinearLR(
-                optimizer,
-                max_iter=10000,
-                warmup_ratio=getattr(args, "warmup_ratio", 0.00001),
-            )
-
-        trainer = Trainer(args, model, criterion, optimizer, scheduler)
-        trainer.setup_model_for_training()
+        model.train()
+        model.set_trainable_params()
 
         train_dataloader = load_multi_datasets_form_json(
             args.data.train_json_path,
@@ -88,8 +84,43 @@ def main(args):
             make_single_dataset=True,
         )
 
-        train_info = get_loader_info(train_dataloader, args.train.epochs, args.train.local_batch_size)
+        train_info = get_loader_info(
+            train_dataloader,
+            args.train.epochs,
+            args.train.local_batch_size,
+            args.train.gradient_accumulate_steps,
+        )
         _, images_per_batch, args.train.iter_per_ep, args.train.num_iters = train_info
+
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = get_optimizer(
+            trainable_params,
+            opt_type="AdamW",
+            lr=args.train.learning_rate,
+            betas=(0.9, 0.98),
+            weight_decay=args.train.decay,
+        )
+
+        criterion = get_criterion(
+            loss_type="diffusion",
+            reduction="mean",
+        )
+
+        if args.train.constant_lr:
+            scheduler = WarmupLinearConstantLR(
+                optimizer,
+                max_iter=args.train.num_iters + 1,
+                warmup_ratio=get_warmup_ratio(args),
+            )
+        else:
+            scheduler = WarmupLinearLR(
+                optimizer,
+                max_iter=args.train.num_iters + 1,
+                warmup_ratio=get_warmup_ratio(args),
+            )
+
+        trainer = Trainer(args, model, criterion, optimizer, scheduler)
+        trainer.setup_model_for_training()
         trainer.iter_per_ep = args.train.iter_per_ep
         trainer.num_iters = args.train.num_iters
         if not isinstance(trainer.global_step, int):

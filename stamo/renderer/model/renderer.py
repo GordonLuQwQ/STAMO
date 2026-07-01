@@ -22,7 +22,7 @@ from tqdm.auto import tqdm
 
 from stamo.renderer.model.backbone import DiTConditionHead, SD3TransformerBackbone, VisionBackbone
 from stamo.renderer.model.projector import Projector
-from stamo.renderer.utils.device import get_accelerator_device  # edit for musa
+from stamo.renderer.utils.device import get_accelerator_device
 from stamo.renderer.utils.overwatch import initialize_overwatch
 
 
@@ -73,7 +73,7 @@ def retrieve_timesteps(
 class RenderNet(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.device = get_accelerator_device()  # edit for musa
+        self.device = get_accelerator_device()
 
         self.vision_backbone = VisionBackbone(
             img_size=args.data.img_size,
@@ -562,7 +562,7 @@ if __name__ == "__main__":
 
     args = OmegaConf.load("./configs/debug.yaml")
 
-    device = get_accelerator_device()  # edit for musa
+    device = get_accelerator_device()
     model = RenderNet(args).to(device)
 
     images = torch.randn((4, 3, args.data.img_size, args.data.img_size))
