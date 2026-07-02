@@ -1,0 +1,54 @@
+seed: 33
+do_train: True
+log_dir: "logs"
+resume: False
+resume_path: ""
+task_name: "egoverse.1965"
+fabric: False
+
+
+vision_backbone:
+  model_name: "vit_base_patch14_reg4_dinov2.lvd142m"
+  local_ckpt: "/workspace/weights/vit_base_patch14_reg4_dinov2.lvd142m/pytorch_model.bin"
+  pretrained: False
+
+
+projector:
+  num_token: 2
+  num_attn_layers: 6
+  num_attn_compress_layers: 6
+  hidden_dim: 1024
+  cross_attention_dim: 512
+  output_align_dim: 4096
+
+
+render_net:
+  token_dropout: False
+  eval_scheduler: ddpm
+  guidance_scale: 1
+  num_inference_steps: 50
+  sd3:
+    local_ckpt: "/workspace/weights/stable-diffusion-3-medium-diffusers"
+
+
+data:
+  flip_p: 0.5
+  img_size: 224
+  num_workers: 8
+  train_json_path: "./jsons/train_egomimic.json"
+  eval_json_path: "./jsons/eval_egomimic.json"
+
+
+train:
+  dist: True
+  epochs: 20
+  num_iters: 10000
+  eval_step: 10000
+  save_step: 20000
+  local_batch_size: 8
+  learning_rate: 3e-5
+  decay: 1e-3
+  constant_lr: False
+  eval_scheduler: ddpm
+  ckpt_save_dir: "ckpts"
+  gradient_accumulate_steps: 1
