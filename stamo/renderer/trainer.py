@@ -288,7 +288,15 @@ class Trainer:
         self.prepare_dist_model()
 
     def train_eval_by_iter(self, train_loader, eval_loader=None, use_tqdm=True) -> None:
-        self.model, self.optimizer, train_loader = self.accelerator.prepare(self.model, self.optimizer, train_loader)
+        deepspeed_plugin = getattr(self.accelerator, "deepspeed_plugin", None)
+        if deepspeed_plugin is not None and (
+            deepspeed_plugin.is_auto("train_micro_batch_size_per_gpu")
+            or deepspeed_plugin.get_value("train_micro_batch_size_per_gpu") is None
+        ):
+            deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = self.local_batch_size
+
+        # Data loaders already use rank-aware samplers; do not let Accelerate shard them again.
+        self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
         if self._deferred_deepspeed_resume:
             self._resume_deepspeed_checkpoint()

@@ -99,7 +99,7 @@ class ImageData(Dataset):
         self.flip_p = flip_p
 
         self.metadata = []
-        with open(metadata_path, "r+", encoding="utf8") as f:
+        with open(metadata_path, "r", encoding="utf8") as f:
             for item in jsonlines.Reader(f):
                 self.metadata.append(item["image"])
 
@@ -122,7 +122,7 @@ class ImageData(Dataset):
         return image
 
     def add(self, metadata_path):
-        with open(metadata_path, "r+", encoding="utf8") as f:
+        with open(metadata_path, "r", encoding="utf8") as f:
             for item in jsonlines.Reader(f):
                 self.metadata.append(item["image"])
         self.length = len(self.metadata)

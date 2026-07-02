@@ -152,7 +152,7 @@ and passes it to `accelerate launch` together with `--num_machines` and
 4. Build distributed train and eval dataloaders.
 5. Compute effective global batch size and total training steps.
 6. Build optimizer and scheduler from trainable parameters.
-7. Wrap model, optimizer, and train loader with `Accelerator.prepare`.
+7. Wrap model and optimizer with `Accelerator.prepare`; data loaders keep the repo's rank-aware samplers.
 8. Train with `accelerator.accumulate` and save checkpoints from the main process.
 
 Effective global batch size:

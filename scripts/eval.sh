@@ -1,6 +1,9 @@
-# edit for musa
-DS_ACCELERATOR=${DS_ACCELERATOR:-musa} MUSA_VISIBLE_DEVICES=${MUSA_VISIBLE_DEVICES:-0} fabric run model validate_renderer.py \
-    --config_path configs/eval.yaml \
-    --devices=1 \
-    --accelerator=${STAMO_ACCELERATOR:-musa} \
-    --precision="32"
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_PATH=${CONFIG_PATH:-configs/eval.yaml}
+
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export DS_ACCELERATOR="${DS_ACCELERATOR:-cuda}"
+
+python validate_renderer.py --config_path "${CONFIG_PATH}"

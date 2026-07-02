@@ -1,0 +1,1192 @@
+import json
+import os
+import re
+import time
+from contextlib import nullcontext
+from typing import Any, Dict
+
+import numpy as np
+import torch
+import torch.distributed as DIST
+import torchvision.transforms as T
+from lightning.fabric import Fabric
+from lightning.fabric.loggers import TensorBoardLogger
+from PIL import Image
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+from stamo.renderer.model.renderer import RenderNet
+from stamo.renderer.utils.data import complex_to_device, fp32_to_bf16, fp32_to_fp16, move_to_cuda
+from stamo.renderer.utils.device import get_accelerator_device  # edit for musa
+from stamo.renderer.utils.files import ensure_directory, ensure_dirname
+from stamo.renderer.utils.metrics import Meter, Timer, calculate_psnr, calculate_ssim, get_parameters
+from stamo.renderer.utils.overwatch import initialize_overwatch
+
+
+overwatch = initialize_overwatch(__name__)
+
+
+class Trainer:
+    def __init__(self, args, model: RenderNet, criterion=None, optimizer=None, lr_scheduler=None) -> None:
+        self.model: RenderNet = model
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+
+        self.local_rank = overwatch.local_rank()
+        self.rank = overwatch.rank()
+        self.device = get_accelerator_device(self.local_rank if overwatch.world_size() > 1 else None)  # edit for musa
+
+        self.epoch = -1
+        self.global_step = -1
+
+        self.eval_before_train = False
+
+        self.use_deepspeed = args.deepspeed
+        self.use_fabric = args.fabric and not self.use_deepspeed
+        self.deepspeed_zero_stage = int(args.train.get("deepspeed_zero_stage", 0))
+        self.deepspeed_fp16 = bool(args.train.get("deepspeed_fp16", False))
+        self.deepspeed_skip_model_broadcast = bool(args.train.get("deepspeed_skip_model_broadcast", False))
+        # Avoid an extra MCCL scalar all_reduce on every micro-step.
+        # Gradient synchronization is still handled by DeepSpeed.
+        self.reduce_metrics_across_ranks = bool(
+            args.train.get("reduce_metrics_across_ranks", False)
+        )
+        # Limit preview images written during each validation.
+        self.max_eval_images_to_save = int(
+            args.train.get("max_eval_images_to_save", 32)
+        )
+        # Log less frequently to avoid a MUSA->CPU synchronization on every
+        # micro-step. This changes logging frequency only, not optimization.
+        self.log_interval = max(
+            1,
+            int(args.train.get("log_interval", 20)),
+        )
+        # Save validation previews from every rank into separate directories.
+        # No image gather is used, so this adds no extra MCCL traffic.
+        self.save_eval_images_all_ranks = bool(
+            args.train.get("save_eval_images_all_ranks", True)
+        )
+        # Limit TensorBoard preview size even if many JPEGs are saved per rank.
+        self.tensorboard_eval_images = max(
+            1,
+            int(args.train.get("tensorboard_eval_images", 16)),
+        )
+        self.deepspeed_steps_per_print = max(
+            1,
+            int(args.train.get("deepspeed_steps_per_print", 1000)),
+        )
+        self.eval_jpeg_quality = min(
+            100,
+            max(1, int(args.train.get("eval_jpeg_quality", 90))),
+        )
+        self.save_eval_gt = bool(
+            args.train.get("save_eval_gt", True)
+        )
+
+        # Do not add custom distributed metric collectives during training or
+        # validation. DeepSpeed still performs the collectives required for
+        # gradient synchronization. This flag is retained only so old YAML
+        # files remain loadable.
+        if self.reduce_metrics_across_ranks and overwatch.is_rank_zero():
+            overwatch.warning(
+                "Ignoring train.reduce_metrics_across_ranks=true: "
+                "custom metric all_reduce is disabled for MUSA stability."
+            )
+        self.reduce_metrics_across_ranks = False
+
+        self.resume = args.resume
+        self.resume_path = args.resume_path
+        self.do_train = args.do_train
+
+        self.num_iters = args.train.num_iters
+        self.epochs = args.train.epochs
+        self.eval_step = args.train.eval_step
+        self.save_step = args.train.save_step
+        self.local_batch_size = args.train.local_batch_size
+        self.gradient_accumulate_steps = args.train.gradient_accumulate_steps
+        self.iter_per_ep = None
+
+        if self.gradient_accumulate_steps <= 0:
+            raise ValueError("gradient_accumulate_steps must be positive")
+        if self.save_step > 0 and self.save_step % self.gradient_accumulate_steps != 0:
+            raise ValueError(
+                "save_step must be divisible by gradient_accumulate_steps "
+                "so checkpoints are written on an optimizer boundary: "
+                f"save_step={self.save_step}, "
+                f"gradient_accumulate_steps={self.gradient_accumulate_steps}"
+            )
+        if self.eval_step > 0 and self.eval_step % self.gradient_accumulate_steps != 0:
+            raise ValueError(
+                "eval_step must be divisible by gradient_accumulate_steps "
+                "so validation starts on an optimizer boundary: "
+                f"eval_step={self.eval_step}, "
+                f"gradient_accumulate_steps={self.gradient_accumulate_steps}"
+            )
+
+        self.seed = args.seed
+        self.task_name = args.task_name
+        self.img_size = args.data.img_size
+        self.log_dir = os.path.join(args.log_dir, args.task_name)
+        self.ckpt_save_dir = os.path.join(args.train.ckpt_save_dir, args.task_name)
+
+        if overwatch.is_rank_zero() and args.do_train:
+            ensure_directory(self.log_dir)
+            self.writer = SummaryWriter(
+                log_dir=self.log_dir, comment="StaMo Renderer"
+            )  # 这里的logs要与--logdir的参数一样
+
+    def move_model_to_cuda(self) -> None:
+        self.model.to(self.device)
+        if self.optimizer is not None:
+            if isinstance(self.optimizer, list):
+                for i in range(len(self.optimizer)):
+                    self.optimizer[i].load_state_dict(
+                        complex_to_device(self.optimizer[i].state_dict(), device=self.device)
+                    )
+            else:
+                self.optimizer.load_state_dict(complex_to_device(self.optimizer.state_dict(), device=self.device))
+
+    # def verify_model_checksum(self) -> None:
+    #     if not (DIST.is_available() and DIST.is_initialized() and overwatch.world_size() > 1):
+    #         return
+
+    #     module = self.model.module if hasattr(self.model, "module") else self.model
+    #     checksum = torch.zeros(3, device=self.device, dtype=torch.float32)
+    #     with torch.no_grad():
+    #         for tensor in list(module.parameters()) + list(module.buffers()):
+    #             if tensor is None or tensor.numel() == 0:
+    #                 continue
+    #             data = tensor.detach().to(device=self.device, dtype=torch.float32)
+    #             checksum[0] += data.sum()
+    #             checksum[1] += data.abs().sum()
+    #             checksum[2] += data.square().sum()
+
+    #     local_checksum = checksum.clone()
+    #     avg_checksum = checksum.clone()
+    #     DIST.all_reduce(avg_checksum)
+    #     avg_checksum /= overwatch.world_size()
+
+    #     diff = (local_checksum - avg_checksum).abs()
+    #     rel_diff = diff / avg_checksum.abs().clamp_min(1.0)
+    #     max_abs_diff = diff.max()
+    #     max_rel_diff = rel_diff.max()
+    #     DIST.all_reduce(max_abs_diff, op=DIST.ReduceOp.MAX)
+    #     DIST.all_reduce(max_rel_diff, op=DIST.ReduceOp.MAX)
+    #     if max_abs_diff.item() > 1e3 and max_rel_diff.item() > 1e-5:
+    #         raise RuntimeError(  # edit for musa
+    #             f"MUSA DeepSpeed model checksum mismatch across ranks: "
+    #             f"max_abs_diff={max_abs_diff.item():.6f}, max_rel_diff={max_rel_diff.item():.6e}"
+    #         )
+
+    #     overwatch.info(  # edit for musa
+    #         f"MUSA DeepSpeed model checksum verified: {local_checksum.tolist()}, "
+    #         f"max_abs_diff={max_abs_diff.item():.6f}, max_rel_diff={max_rel_diff.item():.6e}"
+    #     )
+    def verify_model_checksum(self) -> None:
+  
+        if not (
+            DIST.is_available()
+            and DIST.is_initialized()
+            and overwatch.world_size() > 1
+        ):
+            return
+
+        overwatch.warning(
+            f"[Rank {self.rank}] Starting lightweight model checksum..."
+        )
+
+        module = (
+            self.model.module
+            if hasattr(self.model, "module")
+            else self.model
+        )
+
+        tensors = [
+            tensor
+            for tensor in list(module.parameters())
+            + list(module.buffers())
+            if tensor is not None and tensor.numel() > 0
+        ]
+
+        checksum = torch.zeros(
+            3,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        # 最多从整个模型中均匀选择 64 个 tensor。
+        max_sampled_tensors = 64
+        tensor_stride = max(
+            1,
+            len(tensors) // max_sampled_tensors,
+        )
+
+        with torch.no_grad():
+            sampled_count = 0
+
+            for tensor_index in range(
+                0,
+                len(tensors),
+                tensor_stride,
+            ):
+                if sampled_count >= max_sampled_tensors:
+                    break
+
+                tensor = tensors[tensor_index]
+                flat = tensor.detach().reshape(-1)
+
+                # 每个被选中的 tensor 只读取前 16 个值。
+                sample_size = min(16, flat.numel())
+                sample = flat[:sample_size].to(
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+
+                checksum[0] += sample.sum()
+                checksum[1] += sample.abs().sum()
+                checksum[2] += sample.square().sum()
+
+                sampled_count += 1
+
+        local_checksum = checksum.clone()
+        average_checksum = checksum.clone()
+
+        overwatch.warning(
+            f"[Rank {self.rank}] Checksum sampling complete; "
+            f"entering MCCL all_reduce..."
+        )
+
+        DIST.all_reduce(
+            average_checksum,
+            op=DIST.ReduceOp.SUM,
+        )
+        average_checksum /= overwatch.world_size()
+
+        difference = (
+            local_checksum - average_checksum
+        ).abs()
+
+        relative_difference = (
+            difference
+            / average_checksum.abs().clamp_min(1.0)
+        )
+
+        max_absolute_difference = difference.max()
+        max_relative_difference = (
+            relative_difference.max()
+        )
+
+        DIST.all_reduce(
+            max_absolute_difference,
+            op=DIST.ReduceOp.MAX,
+        )
+        DIST.all_reduce(
+            max_relative_difference,
+            op=DIST.ReduceOp.MAX,
+        )
+
+        max_abs = float(
+            max_absolute_difference.cpu().item()
+        )
+        max_rel = float(
+            max_relative_difference.cpu().item()
+        )
+
+        if max_abs > 1e-2 and max_rel > 1e-5:
+            raise RuntimeError(
+                "MUSA DeepSpeed model checksum mismatch "
+                f"across ranks: max_abs_diff={max_abs:.6f}, "
+                f"max_rel_diff={max_rel:.6e}"
+            )
+
+        overwatch.info(
+            "MUSA DeepSpeed lightweight checksum verified: "
+            f"sampled_tensors={sampled_count}, "
+            f"local_checksum="
+            f"{local_checksum.cpu().tolist()}, "
+            f"max_abs_diff={max_abs:.6f}, "
+            f"max_rel_diff={max_rel:.6e}"
+        )
+
+    def prepare_dist_model(self) -> None:
+        if self.use_deepspeed:
+            import deepspeed
+
+            original_broadcast_model = None
+            if self.deepspeed_skip_model_broadcast:  # edit for musa
+                from deepspeed.runtime.engine import DeepSpeedEngine  # edit for musa
+
+                if hasattr(DeepSpeedEngine, "_broadcast_model"):  # edit for musa
+                    original_broadcast_model = DeepSpeedEngine._broadcast_model  # edit for musa
+                    DeepSpeedEngine._broadcast_model = lambda self: None  # edit for musa
+
+            ds_config = {
+                "train_micro_batch_size_per_gpu": self.local_batch_size,
+                "gradient_accumulation_steps": self.gradient_accumulate_steps,
+                "steps_per_print": self.deepspeed_steps_per_print,
+                "fp16": {"enabled": self.deepspeed_fp16},
+                "bf16": {"enabled": False},
+            }
+            if self.deepspeed_zero_stage > 0:
+                ds_config["zero_optimization"] = {
+                    "stage": self.deepspeed_zero_stage,
+                    "allgather_partitions": True,
+                    "reduce_scatter": True,
+                    "overlap_comm": True,
+                    "contiguous_gradients": True,
+                }
+            try:
+                self.model, self.optimizer, _, self.lr_scheduler = deepspeed.initialize(
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    lr_scheduler=self.lr_scheduler,
+                    config=ds_config,
+                )
+            finally:
+                if original_broadcast_model is not None:  # edit for musa
+                    DeepSpeedEngine._broadcast_model = original_broadcast_model  # edit for musa
+            if self.resume:
+                assert os.path.exists(self.resume_path)
+                overwatch.warning(f"Resuming from {self.resume_path}")
+                self.load_checkpoint(self.resume_path)
+            if self.deepspeed_skip_model_broadcast:  # edit for musa
+                self.verify_model_checksum()  # edit for musa
+            if not self.do_train:
+                self.model.eval()
+            overwatch.info(f"Successfully built models with {get_parameters(self.model)} parameters")
+            return
+
+        tb = TensorBoardLogger(root_dir=self.log_dir, version=0)
+        self.fabric = Fabric(loggers=tb)
+        if self.resume:
+            assert os.path.exists(self.resume_path)
+
+            overwatch.warning(f"Resuming from {self.resume_path}")
+            self.load_checkpoint(self.resume_path)
+
+        self.model, self.optimizer = self.fabric.setup(self.model, self.optimizer)
+
+        if not self.do_train:
+            self.model.eval()
+        overwatch.info(f"Successfully built models with {get_parameters(self.model)} parameters")
+
+    def forward_step(self, inputs, **kwargs) -> Dict[str, Any]:
+        outputs = self.model(inputs, **kwargs)
+        return outputs
+
+    def backward_step(self, loss) -> None:
+        if self.use_deepspeed:
+            self.model.backward(loss)
+        elif self.use_fabric:
+            self.fabric.backward(loss)
+        else:
+            loss.backward()
+
+    def prepare_batch(self, batch) -> Dict[str, Any]:
+        batch = move_to_cuda(batch, device=self.device)  # edit for musa
+        if self.use_deepspeed and self.deepspeed_fp16:
+            batch = fp32_to_fp16(batch)
+        elif self.use_fabric:
+            batch = fp32_to_bf16(batch)
+        return batch
+
+    def step(self, optimizer_idx=-1) -> None:
+        if self.use_deepspeed:
+            self.model.step()
+            return
+        if optimizer_idx >= 0 and isinstance(self.optimizer, list):
+            optimizer = self.optimizer[optimizer_idx]
+        else:
+            optimizer = self.optimizer
+        optimizer.step()
+        optimizer.zero_grad()
+
+    def reduce_mean(self, v) -> float:
+        """Convert a local metric to a Python float without MCCL collectives.
+
+        DeepSpeed still synchronizes gradients. This function is used only
+        for logging and deliberately avoids distributed all_reduce calls.
+        """
+        if not torch.is_tensor(v):
+            return float(v)
+
+        value = v.detach().float()
+        if value.numel() != 1:
+            value = value.mean()
+        return float(value.cpu().item())
+
+    def save_checkpoint(self) -> None:
+        save_path = os.path.join(self.ckpt_save_dir, str(self.global_step))
+        overwatch.warning(f"Saving models to {save_path}")
+
+        if self.use_deepspeed:
+            self.model.save_checkpoint(
+                save_path,
+                tag=str(self.global_step),
+                client_state={"global_step": int(self.global_step)},
+            )
+        elif overwatch.is_rank_zero():
+            ensure_directory(save_path)
+            self.model.save_checkpoint(save_path, self.global_step)
+
+    def load_checkpoint(self, load_path) -> None:
+        result = self.model.load_checkpoint(load_path)
+
+        if self.use_deepspeed:
+            loaded_path, client_state = result
+            if loaded_path is None:
+                raise RuntimeError(
+                    f"Failed to load DeepSpeed checkpoint: {load_path}"
+                )
+
+            global_step = None
+            if isinstance(client_state, dict):
+                global_step = client_state.get("global_step")
+
+            if global_step is None:
+                # Compatibility with old checkpoints without client_state.
+                candidates = [
+                    os.path.basename(str(loaded_path).rstrip("/")),
+                    os.path.basename(str(load_path).rstrip("/")),
+                ]
+                for candidate in candidates:
+                    match = re.search(r"(\d+)$", candidate)
+                    if match:
+                        global_step = int(match.group(1))
+                        break
+
+            self.global_step = int(global_step or 0)
+        else:
+            self.global_step = int(result)
+
+        overwatch.warning(
+            f"Resumed at global_step={self.global_step}"
+        )
+
+    def setup_model_for_training(self) -> None:
+        if overwatch.is_rank_zero():
+            overwatch.warning(f"Existing dirs detected {self.log_dir}")
+            ensure_dirname(self.log_dir, override=False)
+
+        self.model.set_trainable_params()
+        if not self.use_fabric and not self.use_deepspeed:
+            self.move_model_to_cuda()
+        self.prepare_dist_model()
+
+    def train_eval_by_iter(
+        self,
+        train_loader,
+        eval_loader=None,
+        use_tqdm=True,
+    ) -> None:
+        if self.use_fabric:
+            train_loader = self.fabric.setup_dataloaders(
+                train_loader,
+                use_distributed_sampler=False,
+            )
+
+        if not self.num_iters:
+            overwatch.warning("Skip train & val phase...")
+            return
+
+        overwatch.warning("Start train & val phase...")
+
+        val_examples = (
+            len(eval_loader.dataset)
+            if eval_loader is not None
+            else 0
+        )
+        val_batches = (
+            len(eval_loader)
+            if eval_loader is not None
+            else 0
+        )
+
+        overwatch.warning(
+            f"Train examples: {len(train_loader.dataset)},\n"
+            f"Val examples: {val_examples}, {val_batches}\n"
+            f"epochs: {self.epochs}, iters: {self.num_iters},\n"
+            f"eval_step: {self.eval_step}, "
+            f"save_step: {self.save_step},\n"
+            f"log_interval: {self.log_interval},\n"
+            f"global_batch_size: "
+            f"{self.local_batch_size * overwatch.world_size() * self.gradient_accumulate_steps}, "
+            f"local_batch_size: {self.local_batch_size}."
+        )
+
+        show_progress = bool(
+            use_tqdm and overwatch.is_rank_zero()
+        )
+        train_pbar = tqdm(
+            total=self.num_iters,
+            disable=not show_progress,
+            dynamic_ncols=True,
+        )
+        train_meter = Meter()
+
+        if not isinstance(self.global_step, int):
+            raise TypeError(
+                f"global_step must be int, got "
+                f"{type(self.global_step)!r}: "
+                f"{self.global_step!r}"
+            )
+
+        if self.global_step > 0:
+            train_pbar.update(
+                min(self.global_step, self.num_iters)
+            )
+        else:
+            self.global_step = 0
+
+        if (
+            self.eval_before_train
+            and self.global_step == 0
+            and eval_loader is not None
+        ):
+            eval_meter, eval_time = self.eval_fn(
+                eval_loader,
+                use_tqdm=use_tqdm,
+            )
+            if overwatch.is_rank_zero():
+                overwatch.info(
+                    f"[Rank {self.rank}] Valid before train. "
+                    f"Time: {eval_time}\n{eval_meter.avg}"
+                )
+
+        self.model.train()
+
+        log_window_start_time = time.perf_counter()
+        log_window_start_step = self.global_step
+
+        while self.global_step < self.num_iters:
+            train_iter = iter(train_loader)
+
+            while self.global_step < self.num_iters:
+                try:
+                    inputs = next(train_iter)
+                except StopIteration:
+                    break
+
+                self.epoch = (
+                    (self.global_step + 1)
+                    // self.iter_per_ep
+                )
+
+                optimizer_enabled = getattr(
+                    self.optimizer,
+                    "is_enabled",
+                    lambda _: True,
+                )(self.global_step)
+
+                if not optimizer_enabled:
+                    self.global_step += 1
+                    train_pbar.update(1)
+                    continue
+
+                inputs["epoch"] = self.epoch
+                inputs["global_step"] = self.global_step
+
+                if self.use_deepspeed:
+                    # DeepSpeed owns gradient accumulation. Every micro-batch
+                    # must call backward() and step().
+                    inputs = self.prepare_batch(inputs)
+                    outputs = self.forward_step(
+                        inputs,
+                        criterion=self.criterion,
+                    )
+                    self.model.backward(outputs["loss"])
+                    self.model.step()
+
+                else:
+                    is_accumulating = (
+                        (self.global_step + 1)
+                        % self.gradient_accumulate_steps
+                        != 0
+                    )
+
+                    sync_context = (
+                        self.fabric.no_backward_sync(
+                            self.model,
+                            enabled=is_accumulating,
+                        )
+                        if self.use_fabric
+                        else nullcontext()
+                    )
+
+                    with sync_context:
+                        inputs = self.prepare_batch(inputs)
+                        outputs = self.forward_step(
+                            inputs,
+                            criterion=self.criterion,
+                        )
+                        self.backward_step(outputs["loss"])
+
+                    if not is_accumulating:
+                        self.step()
+                        if self.lr_scheduler is not None:
+                            self.lr_scheduler.step()
+
+                completed_step = self.global_step + 1
+                should_log = (
+                    completed_step == 1
+                    or completed_step % self.log_interval == 0
+                )
+
+                metric_and_loss = {}
+                if should_log:
+                    raw_metric_and_loss = {
+                        key: value
+                        for key, value in outputs.items()
+                        if key.split("_")[0]
+                        in {"metric", "loss"}
+                    }
+
+                    if self.reduce_metrics_across_ranks:
+                        metric_and_loss = {
+                            key: self.reduce_mean(value)
+                            for key, value
+                            in raw_metric_and_loss.items()
+                        }
+                    elif overwatch.is_rank_zero():
+                        metric_and_loss = {
+                            key: float(
+                                value.detach()
+                                .float()
+                                .mean()
+                                .cpu()
+                                .item()
+                            )
+                            if torch.is_tensor(value)
+                            else float(value)
+                            for key, value
+                            in raw_metric_and_loss.items()
+                        }
+
+                    if overwatch.is_rank_zero():
+                        train_meter.update(metric_and_loss)
+
+                        elapsed = max(
+                            time.perf_counter()
+                            - log_window_start_time,
+                            1e-9,
+                        )
+                        window_steps = max(
+                            completed_step
+                            - log_window_start_step,
+                            1,
+                        )
+                        images_per_second = (
+                            window_steps
+                            * self.local_batch_size
+                            * overwatch.world_size()
+                            / elapsed
+                        )
+
+                        if show_progress:
+                            train_pbar.set_description(
+                                "Metering: "
+                                + str(train_meter)
+                                + f", {images_per_second:.2f} img/s"
+                            )
+
+                        if hasattr(self, "writer"):
+                            for key, value in metric_and_loss.items():
+                                self.writer.add_scalar(
+                                    key,
+                                    value,
+                                    completed_step,
+                                )
+                            self.writer.add_scalar(
+                                "performance/images_per_second",
+                                images_per_second,
+                                completed_step,
+                            )
+
+                        log_window_start_time = time.perf_counter()
+                        log_window_start_step = completed_step
+
+                self.global_step = completed_step
+                train_pbar.update(1)
+
+                if (
+                    self.save_step > 0
+                    and self.global_step
+                    % self.save_step
+                    == 0
+                ):
+                    overwatch.warning("Saving model...")
+                    self.save_checkpoint()
+
+                if (
+                    self.eval_step > 0
+                    and self.global_step
+                    % self.eval_step
+                    == 0
+                ):
+                    overwatch.warning("Evaluating...")
+                    if eval_loader is not None:
+                        eval_meter, eval_time = self.eval_fn(
+                            eval_loader,
+                            use_tqdm=use_tqdm,
+                        )
+                        if overwatch.is_rank_zero():
+                            overwatch.info(
+                                f"[Rank {self.rank}] "
+                                f"Valid Step: "
+                                f"{self.global_step}, "
+                                f"Time: {eval_time}\n"
+                                f"{eval_meter.avg}"
+                            )
+                    train_meter = Meter()
+                    log_window_start_time = time.perf_counter()
+                    log_window_start_step = self.global_step
+
+        train_pbar.close()
+
+        if (
+            self.save_step <= 0
+            or self.global_step
+            % self.save_step
+            != 0
+        ):
+            overwatch.warning("Saving model...")
+            self.save_checkpoint()
+
+        if (
+            eval_loader is not None
+            and (
+                self.eval_step <= 0
+                or self.global_step
+                % self.eval_step
+                != 0
+            )
+        ):
+            overwatch.warning("Evaluating...")
+            eval_meter, eval_time = self.eval_fn(
+                eval_loader,
+                use_tqdm=use_tqdm,
+            )
+            if overwatch.is_rank_zero():
+                overwatch.info(
+                    f"[Rank {self.rank}] Valid Step: "
+                    f"{self.global_step}, "
+                    f"Time: {eval_time}\n"
+                    f"{eval_meter.avg}"
+                )
+
+    def eval_fn(self, eval_loader, use_tqdm=True):
+        """Validate independently on every rank and save every rank's images.
+
+        No prediction tensor, image tensor, or scalar metric is gathered with
+        MCCL. Each rank writes to its own directory, so validation image output
+        cannot create cross-rank filename collisions. Per-rank metric JSON files
+        can be aggregated offline without touching the training process.
+        """
+        self.model.eval()
+        eval_meter = Meter()
+        eval_timer = Timer()
+
+        label_imgs = []
+        pred_imgs = []
+
+        show_progress = bool(
+            use_tqdm and overwatch.is_rank_zero()
+        )
+        iterator = tqdm(
+            eval_loader,
+            total=len(eval_loader),
+            disable=not show_progress,
+            dynamic_ncols=True,
+        )
+
+        try:
+            with torch.no_grad():
+                for inputs in iterator:
+                    inputs = self.prepare_batch(inputs)
+                    outputs = self.forward_step(inputs)
+
+                    # Only rank 0 converts model-returned metrics to Python
+                    # numbers. Other ranks avoid unnecessary device syncs.
+                    if overwatch.is_rank_zero():
+                        raw_metric_and_loss = {
+                            key: value
+                            for key, value in outputs.items()
+                            if key.split("_")[0]
+                            in {"metric", "loss"}
+                        }
+                        local_metric_and_loss = {
+                            key: self.reduce_mean(value)
+                            for key, value
+                            in raw_metric_and_loss.items()
+                        }
+                        eval_meter.update(local_metric_and_loss)
+
+                    label_img = (
+                        inputs["images"]
+                        .detach()
+                        .float()
+                        .cpu()
+                    )
+                    pred_img = self.model.inv_vae_transform(
+                        outputs["images"]
+                    )
+                    pred_img = (
+                        torch.clamp(pred_img, 0, 1)
+                        .detach()
+                        .float()
+                        .cpu()
+                    )
+
+                    label_imgs.append(label_img)
+                    pred_imgs.append(pred_img)
+
+            if not label_imgs or not pred_imgs:
+                return (
+                    eval_meter,
+                    eval_timer.elapse(True),
+                )
+
+            label_imgs = torch.cat(label_imgs, dim=0)
+            pred_imgs = torch.cat(pred_imgs, dim=0)
+
+            local_psnr = calculate_psnr(
+                pred_imgs,
+                label_imgs,
+            )
+            local_ssim = calculate_ssim(
+                pred_imgs,
+                label_imgs,
+            )
+            local_psnr_value = (
+                float(local_psnr.detach().cpu().item())
+                if torch.is_tensor(local_psnr)
+                else float(local_psnr)
+            )
+            local_ssim_value = (
+                float(local_ssim.detach().cpu().item())
+                if torch.is_tensor(local_ssim)
+                else float(local_ssim)
+            )
+
+            # Save sufficient statistics for exact global PSNR and a weighted
+            # global SSIM calculation after evaluation, with no live MCCL call.
+            local_squared_error = float(
+                (pred_imgs - label_imgs)
+                .double()
+                .square()
+                .sum()
+                .item()
+            )
+            local_numel = int(pred_imgs.numel())
+            local_count = int(len(pred_imgs))
+
+            step_image_path = os.path.join(
+                self.log_dir,
+                "images",
+                str(self.global_step),
+            )
+            rank_image_path = os.path.join(
+                step_image_path,
+                f"rank_{self.rank}",
+            )
+
+            should_save_rank = (
+                self.save_eval_images_all_ranks
+                or overwatch.is_rank_zero()
+            )
+            preview_count = min(
+                self.max_eval_images_to_save,
+                local_count,
+            )
+            pred_preview = pred_imgs[:preview_count]
+            label_preview = label_imgs[:preview_count]
+
+            image_save_errors = 0
+            if should_save_rank:
+                ensure_directory(rank_image_path)
+                toimg = T.ToPILImage()
+
+                for index in range(preview_count):
+                    try:
+                        pred_path = os.path.join(
+                            rank_image_path,
+                            f"{index:04d}_pred.jpeg",
+                        )
+                        toimg(pred_preview[index]).save(
+                            pred_path,
+                            format="JPEG",
+                            quality=self.eval_jpeg_quality,
+                        )
+
+                        if self.save_eval_gt:
+                            gt_path = os.path.join(
+                                rank_image_path,
+                                f"{index:04d}_gt.jpeg",
+                            )
+                            toimg(label_preview[index]).save(
+                                gt_path,
+                                format="JPEG",
+                                quality=self.eval_jpeg_quality,
+                            )
+                    except (OSError, ValueError) as exc:
+                        # A preview write failure must not destroy a long
+                        # training run. Keep evaluating and report the count.
+                        image_save_errors += 1
+                        if image_save_errors == 1:
+                            overwatch.warning(
+                                f"[Rank {self.rank}] Failed to save an eval "
+                                f"preview: {exc!r}"
+                            )
+
+                metrics = {
+                    "global_step": int(self.global_step),
+                    "rank": int(self.rank),
+                    "world_size": int(overwatch.world_size()),
+                    "num_samples": local_count,
+                    "numel": local_numel,
+                    "squared_error_sum": local_squared_error,
+                    "psnr": local_psnr_value,
+                    "ssim": local_ssim_value,
+                    "saved_pairs": preview_count,
+                    "image_save_errors": image_save_errors,
+                }
+                metrics_path = os.path.join(
+                    rank_image_path,
+                    "metrics.json",
+                )
+                temp_metrics_path = metrics_path + ".tmp"
+                try:
+                    with open(
+                        temp_metrics_path,
+                        "w",
+                        encoding="utf-8",
+                    ) as file:
+                        json.dump(
+                            metrics,
+                            file,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                    os.replace(
+                        temp_metrics_path,
+                        metrics_path,
+                    )
+                except OSError as exc:
+                    overwatch.warning(
+                        f"[Rank {self.rank}] Failed to save eval metrics: "
+                        f"{exc!r}"
+                    )
+                    try:
+                        if os.path.exists(temp_metrics_path):
+                            os.remove(temp_metrics_path)
+                    except OSError:
+                        pass
+
+            if overwatch.is_rank_zero():
+                overwatch.info(
+                    f"Rank-0 PSNR:{local_psnr_value:.4f}"
+                )
+                overwatch.info(
+                    f"Rank-0 SSIM:{local_ssim_value:.4f}"
+                )
+                overwatch.info(
+                    "All-rank eval images are stored under: "
+                    f"{step_image_path}/rank_0 ... rank_"
+                    f"{overwatch.world_size() - 1}"
+                )
+
+                if hasattr(self, "writer"):
+                    tb_count = min(
+                        self.tensorboard_eval_images,
+                        preview_count,
+                    )
+                    self.writer.add_images(
+                        "validation/rank0_pred",
+                        pred_preview[:tb_count],
+                        self.global_step,
+                        dataformats="NCHW",
+                    )
+                    if self.save_eval_gt:
+                        self.writer.add_images(
+                            "validation/rank0_gt",
+                            label_preview[:tb_count],
+                            self.global_step,
+                            dataformats="NCHW",
+                        )
+                    self.writer.add_scalar(
+                        "validation/rank0_psnr",
+                        local_psnr_value,
+                        self.global_step,
+                    )
+                    self.writer.add_scalar(
+                        "validation/rank0_ssim",
+                        local_ssim_value,
+                        self.global_step,
+                    )
+
+            return (
+                eval_meter,
+                eval_timer.elapse(True),
+            )
+        finally:
+            self.model.train()
+
+    def manually_eval(self, images, batch_size=64):
+        self.model.eval()
+
+        label_imgs = images
+        toimg = T.ToPILImage()
+        transforms = T.Compose(
+            [T.Resize((self.img_size, self.img_size), interpolation=T.InterpolationMode.BICUBIC), T.ToTensor()]
+        )
+
+        image_path = os.path.join(self.log_dir, "images", str(self.global_step))
+        ensure_directory(os.path.join(image_path))
+
+        with torch.no_grad():
+            for start_idx in range(0, len(images), batch_size):
+                end_idx = min(start_idx + batch_size, len(images))
+                batch_images = images[start_idx:end_idx]
+
+                tensor_images = torch.stack([transforms(image).to(self.device) for image in batch_images])
+                inputs = {"images": tensor_images}
+
+                inputs = self.prepare_batch(inputs)
+                outputs = self.forward_step(inputs)
+
+                pred_imgs = self.model.inv_vae_transform(outputs["images"])
+                pred_imgs = torch.clamp(pred_imgs, 0, 1)
+
+                overwatch.info(f"PSNR: {calculate_psnr(pred_imgs, tensor_images):.4f}")
+                overwatch.info(f"SSIM: {calculate_ssim(pred_imgs, tensor_images):.4f}")
+
+                pred_imgs = [toimg(pred_img.squeeze().cpu()) for pred_img in pred_imgs]
+
+                for idx, pred_img in enumerate(pred_imgs):
+                    pred_img.save(os.path.join(image_path, f"{start_idx + idx}_pred.jpeg"))
+                    label_imgs[start_idx + idx].save(os.path.join(image_path, f"{start_idx + idx}_gt.jpeg"))
+
+    def interpolation_eval(
+        self,
+        image1,
+        image2,
+        tokens=None,
+        num_interpolation=5,
+        to_video=False,
+        name="interpolation.mp4",
+    ):
+        """
+        对压缩token进行线性插值
+        """
+        self.model.eval()
+
+        transforms = T.Compose(
+            [T.Resize((self.img_size, self.img_size), interpolation=T.InterpolationMode.BICUBIC), T.ToTensor()]
+        )
+
+        with torch.no_grad():
+            image1 = transforms(image1).to(self.device).unsqueeze(0)
+            image2 = transforms(image2).to(self.device).unsqueeze(0)
+
+            inputs1 = self.prepare_batch(image1)
+            inputs2 = self.prepare_batch(image2)
+
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(self.seed)
+
+            outputs = self.model.interpolation_eval(
+                inputs1,
+                inputs2,
+                generator,
+                tokens=tokens,
+                num_interpolation=num_interpolation,
+            )
+
+        toimg = T.ToPILImage()
+
+        images = []
+        for pred_image in outputs:
+            pred_image = self.model.inv_vae_transform(pred_image)
+            pred_image = torch.clamp(pred_image, 0, 1)
+            images.append(toimg(pred_image.cpu()))
+
+        if to_video:
+            import imageio
+
+            video_path = os.path.join(self.log_dir, "images", str(self.global_step))
+            ensure_directory(video_path)
+            save_path = os.path.join(video_path, name)
+            imageio.mimsave(save_path, images, fps=10)
+            return
+
+        image_path = os.path.join(self.log_dir, "images", str(self.global_step))
+        ensure_directory(image_path)
+        for i in range(len(images)):
+            images[i].save(os.path.join(image_path, f"interpolation_{i}.jpeg"))
+
+        widths, heights = zip(*(img.size for img in images))
+        total_width = sum(widths)
+        max_height = max(heights)
+
+        combined_image = Image.new("RGB", (total_width, max_height))
+        x_offset = 0
+        for img in images:
+            combined_image.paste(img, (x_offset, 0))
+            x_offset += img.size[0]
+
+        # 保存拼接后的图像
+        combined_image.save(os.path.join(image_path, f"combined_step_{self.global_step}.jpeg"))
+
+    def delta_interpolation(self, image, start, end):
+        """
+        进行delta插值
+        """
+        self.model.eval()
+
+        toimg = T.ToPILImage()
+        transforms = T.Compose(
+            [T.Resize((self.img_size, self.img_size), interpolation=T.InterpolationMode.BICUBIC), T.ToTensor()]
+        )
+        size = image.size
+
+        with torch.no_grad():
+            start_inputs = transforms(start).to(self.device).unsqueeze(0)
+            end_inputs = transforms(end).to(self.device).unsqueeze(0)
+            image_inputs = transforms(image).to(self.device).unsqueeze(0)
+
+            start_inputs = self.prepare_batch(start_inputs)
+            end_inputs = self.prepare_batch(end_inputs)
+            image_inputs = self.prepare_batch(image_inputs)
+
+            generator = torch.Generator(device=self.device)
+            generator.manual_seed(self.seed)
+
+            outputs = self.model.delta_interpolation(
+                image_inputs,
+                start_inputs,
+                end_inputs,
+                generator,
+            )
+
+        pred_image = self.model.inv_vae_transform(outputs).squeeze(0)
+        pred_image = torch.clamp(pred_image, 0, 1)
+        pred_image = toimg(pred_image.cpu())
+
+        image_path = os.path.join(self.log_dir, "images", str(self.global_step))
+        ensure_directory(os.path.join(image_path))
+
+        pred_image.save(os.path.join(image_path, f"delta_interpolation_{self.global_step}.jpeg"))
+
+        images = [start.resize(size), end.resize(size), image, pred_image.resize(size)]
+        widths, heights = zip(*(img.size for img in images))
+        total_width = sum(widths)
+        max_height = max(heights)
+
+        combined_image = Image.new("RGB", (total_width, max_height))
+        x_offset = 0
+        for img in images:
+            combined_image.paste(img, (x_offset, 0))
+            x_offset += img.size[0]
+
+        combined_image.save(os.path.join(image_path, f"delta_interpolation_combined_{self.global_step}.jpeg"))
