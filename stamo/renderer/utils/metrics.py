@@ -55,14 +55,32 @@ def calculate_ssim(pred, target, max_val=1.0, window_size=11, K1=0.01, K2=0.03):
 
 
 def get_parameters(net: torch.nn.Module):
-    trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    frozen_params = sum(p.numel() for p in net.parameters() if not p.requires_grad)
-    fp32_trainable_params = sum(p.numel() for p in net.parameters() if p.dtype == torch.float32 and p.requires_grad)
-    fp16_trainable_params = sum(p.numel() for p in net.parameters() if p.dtype == torch.float16 and p.requires_grad)
-    bf16_trainable_params = sum(p.numel() for p in net.parameters() if p.dtype == torch.bfloat16 and p.requires_grad)
-    fp32_frozen_params = sum(p.numel() for p in net.parameters() if p.dtype == torch.float32 and not p.requires_grad)
-    fp16_frozen_params = sum(p.numel() for p in net.parameters() if p.dtype == torch.float16 and not p.requires_grad)
-    bf16_frozen_params = sum(p.numel() for p in net.parameters() if p.dtype == torch.bfloat16 and not p.requires_grad)
+    # ZeRO-3 replaces local parameter storage with empty/partitioned tensors.
+    # ``ds_numel`` retains the original global size and prevents misleading
+    # "0 parameters" logs after DeepSpeed initialization.
+    def parameter_numel(parameter):
+        return int(getattr(parameter, "ds_numel", parameter.numel()))
+
+    trainable_params = sum(parameter_numel(p) for p in net.parameters() if p.requires_grad)
+    frozen_params = sum(parameter_numel(p) for p in net.parameters() if not p.requires_grad)
+    fp32_trainable_params = sum(
+        parameter_numel(p) for p in net.parameters() if p.dtype == torch.float32 and p.requires_grad
+    )
+    fp16_trainable_params = sum(
+        parameter_numel(p) for p in net.parameters() if p.dtype == torch.float16 and p.requires_grad
+    )
+    bf16_trainable_params = sum(
+        parameter_numel(p) for p in net.parameters() if p.dtype == torch.bfloat16 and p.requires_grad
+    )
+    fp32_frozen_params = sum(
+        parameter_numel(p) for p in net.parameters() if p.dtype == torch.float32 and not p.requires_grad
+    )
+    fp16_frozen_params = sum(
+        parameter_numel(p) for p in net.parameters() if p.dtype == torch.float16 and not p.requires_grad
+    )
+    bf16_frozen_params = sum(
+        parameter_numel(p) for p in net.parameters() if p.dtype == torch.bfloat16 and not p.requires_grad
+    )
     return {
         "trainable": trainable_params,
         "frozen": frozen_params,

@@ -232,7 +232,7 @@ class DiTConditionHead(nn.Module):
         self.pooled_align_mlp = nn.Linear(4096, pooled_dim)
 
     def forward(self, inputs: torch.Tensor):
-        compress_tokens = inputs  # [bsz, num_token, 2048]
+        compress_tokens = inputs  # [batch, num_tokens, 4096]
         pooled_embeds = compress_tokens.mean(dim=1)
         pooled_embeds = self.pooled_align_mlp(pooled_embeds)
         return pooled_embeds

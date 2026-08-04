@@ -1,0 +1,162 @@
+seed: 33
+do_train: true
+log_dir: "logs"
+resume: false
+resume_path: ""
+task_name: "egoverse_flux"
+fabric: false
+
+
+vision_backbone:
+  model_name: "vit_base_patch16_dinov3.lvd1689m"
+  # Replace this path if the DINO checkpoint is stored elsewhere.
+  local_ckpt: "/workspace/weights/vit_base_patch16_dinov3.lvd1689m/pytorch_model.bin"
+  pretrained: false
+
+
+projector:
+  type: "qformer"
+
+  num_token: 4
+  num_attn_layers: 6
+  num_attention_heads: 8
+  hidden_dim: 1024
+  output_align_dim: 4096
+
+
+render_net:
+  token_dropout: false
+  # Used only for evaluation/generation; training still samples one flow step.
+  num_inference_steps: 50
+
+  # Flow-matching timestep sampling and loss weighting.
+  weighting_scheme: "none"
+  logit_mean: 0.0
+  logit_std: 1.0
+  mode_scale: 1.29
+
+  flux:
+    # Must be a local Diffusers-format FLUX.1-dev directory containing
+    # transformer/, vae/, and scheduler/ subdirectories.
+    local_ckpt: "/workspace/weights/FLUX.1-dev"
+    torch_dtype: "bfloat16"
+
+    # FLUX.1-dev embedded/distilled guidance strength.
+    guidance_scale: 3.5
+
+    # Full-parameter fine-tuning from the downloaded FLUX.1-dev weights.
+    # Projector and the 4096 -> 768 pooled head are trained at the same time.
+    train_transformer: true
+    # ZeRO-3 already leaves ample memory at 224px/batch 1. Avoid checkpoint
+    # recomputation unless a later resolution/batch increase requires it.
+    gradient_checkpointing: false
+
+
+data:
+  flip_p: 0.5
+  # FLUX height/width must be divisible by 16. At 224 this gives
+  # raw latents [B,16,28,28] and packed latents [B,196,64].
+  img_size: 224
+  num_workers: 0
+
+  # Evaluation modes:
+  #   fast_mode: deterministically sample 100 of the 939 tasks below and keep
+  #              all 6 images for each selected task (600 images total).
+  #   test_mode: evaluate all 939 tasks (5634 images total).
+  eval_mode: "fast_mode"
+  fast_eval_num_tasks: 100
+  # A fixed rank-independent seed keeps the same tasks across all 8 ranks,
+  # checkpoints, and resumed runs. Change it to choose another 100-task subset.
+  fast_eval_task_seed: 33
+
+  # Corrupt/missing files may be replaced only a bounded number of times.
+  # A final failure raises with the rank and attempted paths instead of looping.
+  max_image_read_attempts: 8
+  # PyTorch can enforce loader timeout only when num_workers > 0. Keep zero
+  # here while the MUSA process owns loading in the main rank process.
+  loader_timeout_seconds: 0
+  persistent_workers: false
+  worker_start_method: null
+  # The last READ_BEGIN without OPEN_OK identifies a blocked filesystem path.
+  read_trace_dir: "/tmp/stamo_phase_trace"
+  read_trace_samples: 0
+  train_json_path: "/workspace/STAMO/jsons_egoverse_human_egocentric_all_tasks_12k/train_egoverse_human_egocentric_all_tasks_12k.json"
+  eval_json_path: "/workspace/STAMO/jsons_egoverse_human_egocentric_all_tasks_12k/eval_egoverse_fast_6_per_task.json"
+
+
+train:
+  mixed_precision: "bf16"
+  # num_iters is the stopping condition when it is greater than zero.
+  # epochs is retained for epoch/progress logging.
+  epochs: 20
+  num_iters: 100000
+
+  # Evaluate at optimizer step 10000. Because save_step=2000, a resumable
+  # checkpoint is written before every expensive full-set evaluation.
+  eval_step: 10000
+  enable_eval: true
+  run_final_eval: true
+  # Production keeps checkpoints enabled. The verification script overrides
+  # this to false so its short run tests training only, never a large save.
+  enable_checkpointing: true
+  save_step: 2000
+
+  # With 8 cards this is an effective batch size of 1 x 8 x 1 = 8.
+  local_batch_size: 1
+  gradient_accumulate_steps: 1
+
+  # Projector + pooled condition head learning rate.
+  learning_rate: 3e-5
+  # Conservative learning rate for full-parameter FLUX fine-tuning.
+  transformer_learning_rate: 1e-6
+  min_learning_rate: 0.0
+  warmup_ratio: 0.03
+  decay: 1e-3
+  constant_lr: false
+  ckpt_save_dir: "ckpts"
+
+  # Explicit full-shard training for the 12B FLUX transformer. ZeRO-2 leaves
+  # too little per-card headroom once activations and communication buffers are
+  # included, so this production profile intentionally uses ZeRO-3.
+  deepspeed_zero_stage: 3
+  gradient_clipping: 1.0
+  # This must match STAMO_DISTRIBUTED_TIMEOUT_SECONDS in the launch script.
+  # A stuck MCCL collective fails after 10 minutes instead of hanging forever.
+  distributed_timeout_seconds: 600
+  # Start from a deterministic communication schedule on MUSA. Enable overlap
+  # only after this exact profile is stable for several hundred steps.
+  deepspeed_overlap_comm: false
+  # Keep DeepSpeed's upstream parameter-fetch behavior. STAMO previously
+  # forced singleton fetches through a custom all-reduce path, but that path
+  # is not part of upstream DeepSpeed and made the MUSA hang occur earlier.
+  # The separate PR #7418 gradient-bucket backport in trainer.py remains
+  # active for every ZeRO-3 run, independently of this option.
+  deepspeed_stage3_use_all_reduce_for_fetch_params: false
+  # DeepSpeed's generic 500M-element reduction bucket is nearly 1 GiB in BF16.
+  # These explicit values cap the large collectives while keeping useful
+  # coalescing for FLUX's 3072-wide transformer blocks.
+  deepspeed_reduce_bucket_size: 50000000
+  deepspeed_allgather_bucket_size: 50000000
+  deepspeed_stage3_prefetch_bucket_size: 50000000
+  deepspeed_stage3_param_persistence_threshold: 100000
+  deepspeed_stage3_max_live_parameters: 1000000000
+  deepspeed_stage3_max_reuse_distance: 1000000000
+  deepspeed_offload_optimizer_device: "none"
+  deepspeed_offload_param_device: "none"
+  # VAE and DINO remain frozen and are omitted from resumable checkpoints.
+  deepspeed_exclude_frozen_parameters: true
+
+  # ZeRO-3 checkpoints are the authoritative full-training checkpoints.
+  save_renderer_export: false
+
+  log_interval: 20
+  max_eval_images_to_save: 32
+  save_eval_images_all_ranks: false
+
+  # Each rank writes a separate local JSONL trace for the first 20 steps. It
+  # adds no distributed collective and can be disabled after the smoke test.
+  phase_trace: true
+  phase_trace_steps: 20
+  phase_trace_dir: "/tmp/stamo_phase_trace"
+  hang_dump_after_seconds: 120
+  phase_trace_synchronize: false
