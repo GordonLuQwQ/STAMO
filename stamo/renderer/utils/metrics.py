@@ -2,7 +2,89 @@ from datetime import timedelta
 from timeit import default_timer
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.models import inception_v3
+from torchvision.transforms import Normalize, Resize
+
+
+class InceptionV3Features(nn.Module):
+    def __init__(self, device="cpu", weights="../models/inception_v3/inception_v3.pth"):
+        super().__init__()
+        self.device = device
+
+        # pretrained inception
+        self.model = inception_v3(weights=None, transform_input=False, init_weights=True)
+        state_dict = torch.load(weights, map_location=device)
+        self.model.load_state_dict(state_dict)
+        self.model.fc = nn.Identity()
+        self.model.dropout = nn.Identity()
+        self.model.eval().to(device)
+
+        # InceptionV3 expects 299x299 RGB
+        self.resize = Resize((299, 299))
+        self.normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+    @torch.no_grad()
+    def forward(self, x):
+        """
+        x: tensor [B, C, H, W]  ∈ [0,1]
+        return: Inception 特征 [B, 2048]
+        """
+        if x.shape[1] == 1:
+            x = x.repeat(3, 1, 1, 1)  # 灰度图转3通道
+
+        x = self.resize(x)
+        x = self.normalize(x)
+
+        return self.model(x)
+
+
+def matrix_sqrt(A, eps=1e-6):
+    # Singular Value Decomposition (SVD)
+    U, S, V = torch.svd(A)
+    S_sqrt = torch.diag(torch.sqrt(S + eps))
+    return U @ S_sqrt @ V.T
+
+
+def compute_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    """
+    calculate Frechet Distance (FID)
+    """
+    diff = mu1 - mu2
+
+    covmean = matrix_sqrt(sigma1 @ sigma2, eps=eps)
+
+    # FID
+    fid = diff @ diff + torch.trace(sigma1 + sigma2 - 2 * covmean)
+    return fid.item()
+
+
+def calculate_rfid(pred, target, device="cpu"):
+    """
+    pred, target: [B, C, H, W], 取值范围 [0,1]
+    计算重建图 pred 与 GT target 的 FID
+    """
+    extractor = InceptionV3Features(device=device)
+
+    dtype = next(extractor.parameters()).dtype
+
+    pred = pred.to(device=device, dtype=dtype)
+    target = target.to(device=device, dtype=dtype)
+
+    with torch.no_grad():
+        feat_pred = extractor(pred)  # [B, 2048]
+        feat_gt = extractor(target)  # [B, 2048]
+
+    feat_pred = feat_pred.to(device)
+    feat_gt = feat_gt.to(device)
+
+    # 计算均值和协方差
+    mu1, sigma1 = torch.mean(feat_pred, axis=0), torch.cov(feat_pred.T)
+    mu2, sigma2 = torch.mean(feat_gt, axis=0), torch.cov(feat_gt.T)
+
+    fid = compute_frechet_distance(mu1, sigma1, mu2, sigma2)
+    return fid
 
 
 def calculate_psnr(pred, target, max_val=1.0):
@@ -139,3 +221,12 @@ class Timer:
         if readable:
             seconds = str(timedelta(seconds=seconds))
         return seconds
+
+
+if __name__ == "__main__":
+    pred = torch.rand(8, 3, 256, 256)
+    target = torch.rand(8, 3, 256, 256)
+
+    print(f"PSNR: {calculate_psnr(pred, target):.4f}")
+    print(f"SSIM: {calculate_ssim(pred, target):.4f}")
+    print(f"rFID: {calculate_rfid(pred, target):.4f}")
